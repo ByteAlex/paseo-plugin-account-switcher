@@ -32,6 +32,7 @@ async function main(): Promise<void> {
   if (accountId && !account) throw new LauncherError("Assigned account profile is unavailable; launch refused.");
   if (login && account?.source !== "managed") throw new LauncherError("Only managed account profiles support this login command.");
   if (!login && account?.loginToken) throw new LauncherError("Account login is still in progress; launch refused.");
+  if (!login && account?.source === "managed" && registry.integration.restorePending) throw new LauncherError("Account integration is being disabled; launch refused.");
   if (account?.source === "managed") {
     if (!/^[a-zA-Z0-9_-]+$/.test(account.id) || resolve(account.home) !== join(root, "accounts", account.id, provider)) throw new LauncherError("Assigned account profile path is invalid; launch refused.");
     if (login) {
@@ -44,11 +45,18 @@ async function main(): Promise<void> {
       if (!(await lstat(account.home)).isDirectory() || await realpath(account.home) !== join(await realpath(root), "accounts", account.id, provider)) throw new Error();
     } catch { throw new LauncherError("Assigned account profile is missing or redirected; launch refused. Restore the profile or select another account."); }
     try { await prepareProfile({ provider, home: account.home, sourceHome: registry.sourceHomes[provider], sourceEnvironment: registry.sourceEnvironment[provider] }); } catch { throw new LauncherError("Account profile preparation failed; inspect shared provider configuration."); }
-    // The plugin can release a new agent's binding while this waited, and then nothing keeps the profile from being removed or signed in again.
+    // The plugin can release a new agent's binding or disable integration while this waited, and then nothing keeps the profile from being removed or signed in again.
     if (!login) {
       let current;
       try { current = await readRegistry(root); } catch { throw new LauncherError("Account registry is missing or corrupt; launch refused."); }
-      if (!current.bindings.some(candidate => candidate.agentId === agentId)) throw new LauncherError("The account reservation was released while this agent started; launch refused.");
+      const latest = current.bindings.find(candidate => candidate.agentId === agentId && candidate.provider === provider);
+      if (
+        current.integration.restorePending ||
+        (registry.integration.enabled && !current.integration.enabled) ||
+        !latest ||
+        latest.status === "error" ||
+        (latest.launchAccountId ?? latest.currentAccountId) !== account.id
+      ) throw new LauncherError("The account reservation was released while this agent started; launch refused.");
     }
     env = buildAccountEnv(provider, account.home, env);
   }

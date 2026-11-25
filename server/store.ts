@@ -23,7 +23,7 @@ export const RegistrySchema = z.object({
  // Whether discovery found each provider CLI. Registries written before this field assumed both.
  available: z.object({claude:z.boolean(),codex:z.boolean()}).default({claude:true,codex:true}),
  // Providers whose Paseo commands the plugin owns while integration is enabled.
- integration: z.object({enabled:z.boolean(),error:z.string().nullable(),providers:z.array(ProviderSchema).default(["claude","codex"])}),
+ integration: z.object({enabled:z.boolean(),error:z.string().nullable(),providers:z.array(ProviderSchema).default(["claude","codex"]),restorePending:z.boolean().optional()}),
 });
 export type Registry = z.infer<typeof RegistrySchema>;
 export async function readRegistry(root: string): Promise<Registry> {
@@ -42,7 +42,10 @@ export function boundAccount(registry: Registry, agentId: string, provider: Prov
 }
 export class AccountStore {
  private queue: Promise<unknown> = Promise.resolve();
+ private _registrationEpoch = 0;
  constructor(readonly root: string) {}
+ /** Monotonic counter incremented before atomicWrite whenever any binding becomes registrationObserved or confirmed. */
+ get registrationEpoch(): number { return this._registrationEpoch; }
  async initialize(sourceHomes: Registry["sourceHomes"]): Promise<void> {
    await mkdir(this.root, { recursive:true, mode:0o700 });
    try {
@@ -65,7 +68,25 @@ export class AccountStore {
  }
  read(): Promise<Registry> { return readRegistry(this.root); }
  async change<T>(operation:(registry:Registry)=>T|Promise<T>): Promise<T> {
-   const task=this.queue.catch(()=>{}).then(async()=>{const registry=await this.read();const before=JSON.stringify(registry);const value=await operation(registry);const validated=RegistrySchema.parse(registry);if(JSON.stringify(validated)!==before)await atomicWrite(join(this.root,"registry.json"),JSON.stringify(validated,null,2));return value;});
+   const task=this.queue.catch(()=>{}).then(async()=>{
+    const registry=await this.read();
+    const before=JSON.stringify(registry);
+    const beforeBindings=new Map(registry.bindings.map(b=>[b.agentId,{observed:b.registrationObserved,current:b.currentAccountId}]));
+    const value=await operation(registry);
+    const validated=RegistrySchema.parse(registry);
+    if(JSON.stringify(validated)!==before){
+     // Advance registrationEpoch before atomicWrite publishes the new registry so no concurrent probe pass can reuse a pre-registration null.
+     for(const b of validated.bindings){
+      const prev=beforeBindings.get(b.agentId);
+      if((b.registrationObserved&&!prev?.observed)||(b.currentAccountId!==null&&prev?.current===null)||(b.currentAccountId!==null&&!prev)){
+       this._registrationEpoch++;
+       break;
+      }
+     }
+     await atomicWrite(join(this.root,"registry.json"),JSON.stringify(validated,null,2));
+    }
+    return value;
+   });
    this.queue=task; return task;
  }
  async snapshot():Promise<AccountState> {

@@ -8,6 +8,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import { AccountStore } from "../server/store";
 import { accountCommand, accountEnvironment, launchLogin, probeAccount, removeAccountCredentials } from "../server/auth";
 import { installIntegration, launcherPath, launcherScriptPath, launcherWrapper, prepareRuntime, reconcileIntegration, restoreIntegration, writeLaunchers } from "../server/integration";
+import { profileEnv } from "../server/session-env";
 
 const roots: string[] = [];
 afterEach(async () => { vi.unstubAllEnvs(); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
@@ -128,6 +129,37 @@ describe("standalone native-provider launcher", () => {
     const result = await launch;
     expect(result.code).not.toBe(0); expect(result.stdout).toBe(""); expect(result.stderr).toContain("released");
     await expect(stat(join(root, "receipts", "slow.json"))).rejects.toThrow();
+  }, 20_000);
+
+  it("refuses managed launches while restorePending is set or when integration disables mid-preparation", async () => {
+    const { root, store } = await fixture(); const account = await store.add("codex", "Work");
+    await mkdir(account.home, { recursive: true });
+    await store.prepare("restoring", "codex", account.id);
+    await store.change(registry => {
+      registry.integration.enabled = true;
+      registry.integration.restorePending = true;
+      registry.bindings[0].launchAccountId = account.id;
+      registry.bindings[0].launchToken = "launch-r";
+    });
+    await writeLaunchers(store);
+    const duringPending = await run(launcherPath(root, "codex"), ["app-server"], { ...process.env, PASEO_AGENT_ID: "restoring", CODEX_HOME: account.home });
+    expect(duringPending.code).not.toBe(0); expect(duringPending.stdout).toBe(""); expect(duringPending.stderr).toContain("disabled");
+    // Now test a launcher paused in prepareProfile while a full restore completes (clearing restorePending and setting enabled=false, binding.status="error").
+    await store.change(registry => { registry.integration.restorePending = undefined; });
+    const source = (await store.read()).sourceHomes.codex; await mkdir(source, { recursive: true });
+    const config = join(source, "config.toml");
+    expect(spawnSync("mkfifo", [config]).status).toBe(0);
+    const launch = run(launcherPath(root, "codex"), ["app-server"], { ...process.env, PASEO_AGENT_ID: "restoring" });
+    const reading = await open(config, "w");
+    await store.change(registry => {
+      registry.integration.enabled = false;
+      registry.bindings[0].currentAccountId = null;
+      registry.bindings[0].launchToken = null;
+      registry.bindings[0].status = "error";
+    });
+    await reading.close();
+    const afterRestore = await launch;
+    expect(afterRestore.code).not.toBe(0); expect(afterRestore.stdout).toBe(""); expect(afterRestore.stderr).toContain("released");
   }, 20_000);
 
   it("refuses a profile redirected to the shared home by a symlink", async () => {
@@ -422,12 +454,378 @@ describe("auth and config integration", () => {
     expect(patch).not.toHaveBeenCalled();
   });
 
-  it("fails closed on unavailable live config without exposing raw errors", async () => {
+  it("fails closed on unavailable live config without retrying non-timeout errors or exposing raw errors", async () => {
     const { store } = await fixture(); await store.change(state => { state.integration.enabled = true; });
-    const paseo = { config: { get: async () => { throw new Error("fixture-private-config-value"); } } } as unknown as PaseoApi;
+    const get = vi.fn(async () => { throw new Error("fixture-private-config-value"); });
+    const paseo = { config: { get } } as unknown as PaseoApi;
     await expect(reconcileIntegration(paseo, store)).rejects.toThrow("Could not verify Paseo provider commands");
+    expect(get).toHaveBeenCalledTimes(1);
     const registry = await store.read();
     expect(registry.integration.enabled).toBe(false); expect(JSON.stringify(registry)).not.toContain("fixture-private-config-value");
+  });
+
+  it("retries once on transient config timeouts without permanently disabling integration on double timeouts", async () => {
+    const { root, store, cli } = await fixture();
+    const config = { providers: { claude: { command: [process.execPath, cli] }, codex: { command: [process.execPath, cli] } } };
+    const patch = vi.fn(async change => { Object.assign(config.providers, change.providers); return { config }; });
+    const get = vi.fn(async () => ({ config }));
+    const paseo = { config: { get, patch } } as unknown as PaseoApi;
+    get.mockRejectedValueOnce(Object.assign(new Error("Timeout waiting for message (60000ms)"), { code: "DAEMON_REQUEST_TIMEOUT" }));
+    await prepareRuntime(paseo, store);
+    expect(get).toHaveBeenCalledTimes(2);
+    await installIntegration(paseo, store);
+    get.mockClear();
+    get.mockRejectedValueOnce(new Error("Timeout waiting for message (60000ms)"));
+    await reconcileIntegration(paseo, store);
+    expect(get).toHaveBeenCalledTimes(2);
+    expect((await store.read()).integration).toEqual({ enabled: true, error: null, providers: ["claude", "codex"] });
+    expect(config.providers.claude.command).toEqual([launcherPath(root, "claude")]);
+    get.mockClear();
+    get.mockRejectedValue(new Error("No response to get_daemon_config_request after 1500ms"));
+    await expect(reconcileIntegration(paseo, store)).rejects.toThrow(/timed out reading paseo daemon configuration/i);
+    expect(get).toHaveBeenCalledTimes(2);
+    // Double transient timeouts fail the current RPC closed without permanently disabling integration.
+    expect((await store.read()).integration.enabled).toBe(true);
+  });
+
+  it("keeps the first slow config.get in the hedged retry race so a >4s response still succeeds", async () => {
+    const { store, cli } = await fixture();
+    const config = { providers: { claude: { command: [process.execPath, cli] }, codex: { command: [process.execPath, cli] } } };
+    const patch = vi.fn(async change => { Object.assign(config.providers, change.providers); return { config }; });
+    const setupPaseo = { config: { get: async () => ({ config }), patch } } as unknown as PaseoApi;
+    await installIntegration(setupPaseo, store);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      let resolveFirst!: (value: { config: typeof config }) => void;
+      const get = vi.fn()
+        .mockImplementationOnce(() => new Promise(resolve => { resolveFirst = resolve; }))
+        .mockImplementationOnce(() => new Promise(() => {}));
+      const pending = reconcileIntegration({ config: { get } } as unknown as PaseoApi, store);
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(get).toHaveBeenCalledTimes(2);
+      // First request responds at 4.5s while second is still pending: hedged race succeeds!
+      await vi.advanceTimersByTimeAsync(500);
+      resolveFirst({ config });
+      await pending;
+      expect((await store.read()).integration).toEqual({ enabled: true, error: null, providers: ["claude", "codex"] });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not undo a concurrent installIntegration from stale reconcileIntegration or prepareRuntime, while failed installs still fail closed", async () => {
+    const { root, store, cli } = await fixture();
+    vi.stubEnv("PATH", join(root, "no provider cli"));
+    const config: { providers: Record<string, { command?: string[] }> } = { providers: { claude: { command: [process.execPath, cli] } } };
+    const patch = vi.fn(async change => { Object.assign(config.providers, change.providers); return { config }; });
+    const paseo = { config: { get: async () => ({ config: structuredClone(config) }), patch } } as unknown as PaseoApi;
+    await installIntegration(paseo, store);
+    config.providers.codex = { command: [process.execPath, cli] };
+    await prepareRuntime(paseo, store);
+    // Capture the pre-install config snapshot (codex still unowned) and deliver it AFTER installIntegration commits.
+    const staleSnapshot = structuredClone(config);
+    let releaseStale!: () => void, staleStarted!: () => void;
+    const enteredStale = new Promise<void>(resolve => { staleStarted = resolve; });
+    const stalePaseo = {
+      config: {
+        get: vi.fn(async () => {
+          staleStarted();
+          await new Promise<void>(resolve => { releaseStale = resolve; });
+          return { config: staleSnapshot };
+        }),
+      },
+    } as unknown as PaseoApi;
+    const staleReconcile = reconcileIntegration(stalePaseo, store);
+    await enteredStale;
+    // Also start a stale prepareRuntime (startup discovery) before installIntegration commits.
+    let releaseDiscovery!: () => void, discoveryStarted!: () => void;
+    const enteredDiscovery = new Promise<void>(resolve => { discoveryStarted = resolve; });
+    const discoveryPaseo = {
+      config: {
+        get: vi.fn(async () => {
+          discoveryStarted();
+          await new Promise<void>(resolve => { releaseDiscovery = resolve; });
+          return { config: staleSnapshot };
+        }),
+      },
+    } as unknown as PaseoApi;
+    const staleDiscovery = prepareRuntime(discoveryPaseo, store);
+    await enteredDiscovery;
+    // Also start a second reconciliation whose attempts both fail while installIntegration runs.
+    let failSecond!: (error: Error) => void, failStarted!: () => void;
+    const enteredFail = new Promise<void>(resolve => { failStarted = resolve; });
+    const failingPaseo = {
+      config: {
+        get: vi.fn()
+          .mockRejectedValueOnce(new Error("Timeout waiting for message (60000ms)"))
+          .mockImplementationOnce(() => { failStarted(); return new Promise((_, reject) => { failSecond = reject; }); }),
+      },
+    } as unknown as PaseoApi;
+    const failingReconcile = reconcileIntegration(failingPaseo, store);
+    await enteredFail;
+    await installIntegration(paseo, store);
+    releaseStale();
+    releaseDiscovery();
+    failSecond(new Error("Timeout waiting for message (60000ms)"));
+    await Promise.all([staleReconcile, staleDiscovery, failingReconcile]);
+    expect((await store.read()).integration).toEqual({ enabled: true, error: null, providers: ["claude", "codex"] });
+    // A reconciliation starting mid-patch (after daemon config shows the new launcher, before registry commits) must not clear launch tokens.
+    await store.change(state => {
+      state.integration = { enabled: true, error: null, providers: ["claude"] };
+      state.bindings.push({ agentId: "mid-install", provider: "claude", currentAccountId: null, pendingAccountId: null, launchAccountId: "system-claude", launchToken: "keep-me", status: "ready", error: null, registrationObserved: false });
+    });
+    config.providers.codex = { command: [process.execPath, cli] };
+    await prepareRuntime(paseo, store);
+    let finishPatch!: () => void, patchEntered!: () => void;
+    const enteredPatch = new Promise<void>(resolve => { patchEntered = resolve; });
+    const slowPatch = vi.fn(async change => {
+      Object.assign(config.providers, change.providers);
+      patchEntered();
+      await new Promise<void>(resolve => { finishPatch = resolve; });
+      return { config };
+    });
+    const slowInstall = installIntegration({ config: { get: async () => ({ config: structuredClone(config) }), patch: slowPatch } } as unknown as PaseoApi, store);
+    await enteredPatch;
+    const midInstallReconcile = reconcileIntegration({ config: { get: async () => ({ config: structuredClone(config) }) } } as unknown as PaseoApi, store);
+    await Promise.resolve();
+    finishPatch();
+    await Promise.all([slowInstall, midInstallReconcile]);
+    const afterMidInstall = await store.read();
+    expect(afterMidInstall.integration).toEqual({ enabled: true, error: null, providers: ["claude", "codex"] });
+    expect(afterMidInstall.bindings.find(b => b.agentId === "mid-install")?.launchToken).toBe("keep-me");
+    // A concurrent failed install must NOT suppress fail-closed drift detection in reconcileIntegration.
+    let failPatch!: (error: Error) => void, failPatchEntered!: () => void;
+    const enteredFailPatch = new Promise<void>(resolve => { failPatchEntered = resolve; });
+    const failingInstall = installIntegration({
+      config: {
+        get: async () => ({ config: structuredClone(config) }),
+        patch: () => { failPatchEntered(); return new Promise((_, reject) => { failPatch = reject; }); },
+      },
+    } as unknown as PaseoApi, store);
+    await enteredFailPatch;
+    const drifted = structuredClone(config);
+    drifted.providers.codex.command = [process.execPath, cli];
+    const concurrentDrift = reconcileIntegration({ config: { get: async () => ({ config: drifted }) } } as unknown as PaseoApi, store);
+    failPatch(new Error("patch refused"));
+    await expect(failingInstall).rejects.toThrow(/did not apply/);
+    await concurrentDrift;
+    expect((await store.read()).integration.enabled).toBe(false);
+  });
+
+  it("bounds waiting on a slow integration patch without disabling integration or clearing launch tokens", async () => {
+    const { store, cli } = await fixture();
+    const config = { providers: { claude: { command: [process.execPath, cli] }, codex: { command: [process.execPath, cli] } } };
+    const paseo = { config: { get: async () => ({ config: structuredClone(config) }), patch: vi.fn(async change => { Object.assign(config.providers, change.providers); return { config }; }) } } as unknown as PaseoApi;
+    await installIntegration(paseo, store);
+    await store.change(r => {
+      r.bindings.push({ agentId: "busy-patch", provider: "codex", currentAccountId: null, pendingAccountId: null, launchAccountId: "system-codex", launchToken: "keep-busy", status: "ready", error: null, registrationObserved: false });
+    });
+    let releasePatch!: () => void, enteredPatch!: () => void;
+    const patchStarted = new Promise<void>(resolve => { enteredPatch = resolve; });
+    const hungInstall = installIntegration({
+      config: {
+        get: async () => ({ config: structuredClone(config) }),
+        patch: () => { enteredPatch(); return new Promise(resolve => { releasePatch = () => resolve({ config }); }); },
+      },
+    } as unknown as PaseoApi, store);
+    await patchStarted;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const waiting = reconcileIntegration({ config: { get: async () => ({ config: structuredClone(config) }) } } as unknown as PaseoApi, store);
+      const outcome = waiting.then(() => "ok", (error: Error) => error.message);
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(await outcome).toMatch(/integration change is still in progress/i);
+      const state = await store.read();
+      expect(state.integration.enabled).toBe(true);
+      expect(state.bindings.find(b => b.agentId === "busy-patch")?.launchToken).toBe("keep-busy");
+    } finally {
+      vi.useRealTimers();
+      releasePatch();
+      await hungInstall;
+    }
+  });
+
+  it("keeps fail-closed verification when installIntegration fails to write the registry, and bounds slow config.patch under deadline", async () => {
+    const { store, cli } = await fixture();
+    const config: { providers: Record<string, { command: string[] }> } = { providers: { claude: { command: [process.execPath, cli] }, codex: { command: ["/missing/codex"] } } };
+    const initialPaseo = { config: { get: async () => ({ config: structuredClone(config) }), patch: vi.fn(async (change: { providers: Record<string, { command: string[] }> }) => { Object.assign(config.providers, change.providers); return { config }; }) } } as unknown as PaseoApi;
+    await installIntegration(initialPaseo, store);
+    // Now Codex CLI becomes available; installIntegration patches both providers, then fails its registry write.
+    config.providers.codex = { command: [process.execPath, cli] };
+    let releasePatch!: () => void, enteredPatch!: () => void;
+    const patchStarted = new Promise<void>(resolve => { enteredPatch = resolve; });
+    const patchedConfig = structuredClone(config);
+    const partialInstall = installIntegration({
+      config: {
+        get: async () => ({ config: structuredClone(config) }),
+        patch: async (change: { providers: Record<string, { command: string[] }> }) => {
+          Object.assign(patchedConfig.providers, change.providers);
+          enteredPatch();
+          await new Promise<void>(resolve => { releasePatch = resolve; });
+          return { config: patchedConfig };
+        },
+      },
+    } as unknown as PaseoApi, store);
+    await patchStarted;
+    // Fail only the post-patch registry commit write inside installIntegration; subsequent writes still work.
+    const changeSpy = vi.spyOn(store, "change").mockRejectedValueOnce(new Error("disk full"));
+    // Start a concurrent verification while patch is running: once install's registry write fails,
+    // epoch must remain unchanged so verification fails closed against the mismatched daemon state.
+    const verify = reconcileIntegration({ config: { get: async () => ({ config: structuredClone(patchedConfig) }) } } as unknown as PaseoApi, store);
+    releasePatch();
+    await expect(partialInstall).rejects.toThrow(/did not apply/);
+    changeSpy.mockRestore();
+    await verify;
+    expect((await store.read()).integration.enabled).toBe(false);
+    expect((await store.read()).integration.error).toMatch(/Provider commands changed/i);
+    // Also verify installIntegration:
+    // (a) never dispatches config.patch when deadline is already expired,
+    // (b) rejects promptly when config.patch stalls past deadline, holding the mutation gate until patch settles,
+    //     and never commits registry.json late even if patch resolves afterward.
+    const expiredPatch = vi.fn();
+    await expect(installIntegration({
+      config: { get: async () => ({ config: structuredClone(config) }), patch: expiredPatch },
+    } as unknown as PaseoApi, store, Date.now() - 1)).rejects.toThrow(/timed out/i);
+    expect(expiredPatch).not.toHaveBeenCalled();
+
+    let enteredSlowPatch!: () => void, resolveLatePatch!: () => void;
+    const slowPatchStarted = new Promise<void>(resolve => { enteredSlowPatch = resolve; });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const deadline = Date.now() + 2_000;
+      const lateConfig = structuredClone(config);
+      const slowPatchInstall = installIntegration({
+        config: {
+          get: async () => ({ config: structuredClone(lateConfig) }),
+          patch: (change: { providers: Record<string, { command: string[] }> }) => {
+            enteredSlowPatch();
+            return new Promise(resolve => {
+              resolveLatePatch = () => {
+                Object.assign(lateConfig.providers, change.providers);
+                resolve({ config: lateConfig });
+              };
+            });
+          },
+        },
+      } as unknown as PaseoApi, store, deadline);
+      const outcome = slowPatchInstall.then(() => "ok", (error: Error) => error.message);
+      await slowPatchStarted;
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(await outcome).toMatch(/did not apply/i);
+      // While the timed-out patch is still pending, the mutation gate remains held so concurrent calls fail fast as busy.
+      const busyCheck = reconcileIntegration({ config: { get: async () => ({ config: structuredClone(lateConfig) }) } } as unknown as PaseoApi, store, Date.now() + 1_000).then(() => "ok", (error: Error) => error.message);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(await busyCheck).toMatch(/integration change is still in progress/i);
+      // When the late patch finally applies to the daemon config, fail-closed drift is recorded before releasing the gate.
+      resolveLatePatch();
+      vi.useRealTimers();
+      await vi.waitFor(async () => expect((await store.read()).integration.error).toMatch(/Provider commands changed/i));
+      expect((await store.read()).integration.enabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+    // Also verify a late restoreIntegration patch synchronizes registry.json and runs binding cleanup before releasing the gate,
+    // while preserving launchAccountId so a running agent on account A with pending selection B still protects A.
+    const restoreConfig = { providers: { claude: { command: [process.execPath, cli] }, codex: { command: [process.execPath, cli] } } };
+    const restoreSetup = { config: { get: async () => ({ config: structuredClone(restoreConfig) }), patch: vi.fn(async (change: { providers: Record<string, { command: string[] }> }) => { Object.assign(restoreConfig.providers, change.providers); return { config: restoreConfig }; }) } } as unknown as PaseoApi;
+    await installIntegration(restoreSetup, store);
+    await store.change(r => {
+      r.bindings.push({ agentId: "late-restore-agent", provider: "codex", currentAccountId: "managed-A", pendingAccountId: "managed-B", launchAccountId: "managed-A", launchToken: "tok-lr", status: "ready", error: null, registrationObserved: true });
+    });
+    let enteredSlowRestore!: () => void, resolveLateRestore!: () => void;
+    const slowRestoreStarted = new Promise<void>(resolve => { enteredSlowRestore = resolve; });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const restoreDeadline = Date.now() + 2_000;
+      const slowRestore = restoreIntegration({
+        config: {
+          get: async () => ({ config: structuredClone(restoreConfig) }),
+          patch: (change: { providers: Record<string, { command: string[] }> }) => {
+            enteredSlowRestore();
+            return new Promise(resolve => {
+              resolveLateRestore = () => {
+                Object.assign(restoreConfig.providers, change.providers);
+                resolve({ config: restoreConfig });
+              };
+            });
+          },
+        },
+      } as unknown as PaseoApi, store, restoreDeadline);
+      const restoreOutcome = slowRestore.then(() => "ok", (error: Error) => error.message);
+      await slowRestoreStarted;
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(await restoreOutcome).toMatch(/did not restore/i);
+      resolveLateRestore();
+      vi.useRealTimers();
+      await vi.waitFor(async () => expect((await store.read()).integration.enabled).toBe(false));
+      const cleaned = (await store.read()).bindings.find(b => b.agentId === "late-restore-agent");
+      expect(cleaned).toMatchObject({ currentAccountId: null, pendingAccountId: "managed-B", launchAccountId: "managed-A", launchToken: null, status: "error" });
+    } finally {
+      vi.useRealTimers();
+    }
+    // Verify: (a) a late no-op enable on already-healthy integration does NOT disable it or clear launch tokens,
+    // (b) a failed restore patch that did NOT change daemon commands keeps enabled: true for direct retry in Accounts UI,
+    // and (c) persisted restorePending completes binding cleanup across restarts even when an auth override is present.
+    const healthyConfig = { providers: { claude: { command: [process.execPath, cli] }, codex: { command: [process.execPath, cli] } } };
+    const healthySetup = { config: { get: async () => ({ config: structuredClone(healthyConfig) }), patch: vi.fn(async (change: { providers: Record<string, { command: string[] }> }) => { Object.assign(healthyConfig.providers, change.providers); return { config: healthyConfig }; }) } } as unknown as PaseoApi;
+    await installIntegration(healthySetup, store);
+    await store.change(r => {
+      r.bindings.push({ agentId: "keep-healthy", provider: "codex", currentAccountId: "managed-2", pendingAccountId: "managed-3", launchAccountId: "managed-2", launchToken: "tok-kh", status: "ready", error: null, registrationObserved: true });
+    });
+    let enteredNoop!: () => void, resolveNoop!: () => void;
+    const noopStarted = new Promise<void>(resolve => { enteredNoop = resolve; });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const noopInstall = installIntegration({
+        config: {
+          get: async () => ({ config: structuredClone(healthyConfig) }),
+          patch: () => { enteredNoop(); return new Promise(resolve => { resolveNoop = () => resolve({ config: healthyConfig }); }); },
+        },
+      } as unknown as PaseoApi, store, Date.now() + 1_000);
+      const noopOutcome = noopInstall.then(() => "ok", (error: Error) => error.message);
+      await noopStarted;
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(await noopOutcome).toMatch(/did not apply/i);
+      resolveNoop();
+      vi.useRealTimers();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect((await store.read()).integration.enabled).toBe(true);
+      expect((await store.read()).bindings.find(b => b.agentId === "keep-healthy")?.launchToken).toBe("tok-kh");
+    } finally {
+      vi.useRealTimers();
+    }
+    // Failed restore patch that leaves launchers in daemon config keeps integration.enabled true so user can directly retry Disable.
+    const unchangedConfig = structuredClone(healthyConfig);
+    await expect(restoreIntegration({
+      config: {
+        get: async () => ({ config: structuredClone(unchangedConfig) }),
+        patch: async () => { throw new Error("daemon refused patch"); },
+      },
+    } as unknown as PaseoApi, store)).rejects.toThrow(/did not restore/i);
+    await vi.waitFor(async () => expect((await store.read()).integration.restorePending).toBeUndefined());
+    expect((await store.read()).integration.enabled).toBe(true);
+    // Persisted restorePending:
+    // (1) blocks profileEnv from injecting managed credentials during the restore window,
+    // (2) is NOT erased by a failed/expired retry of restoreIntegration, and
+    // (3) survives a fresh AccountStore (simulated restart) and completes cleanup even if an auth override is set.
+    const managedForEnv = await store.add("codex", "Env Managed");
+    await store.change(r => {
+      r.integration.restorePending = true;
+      r.bindings.push({ agentId: "env-guarded", provider: "codex", currentAccountId: managedForEnv.id, pendingAccountId: null, launchAccountId: managedForEnv.id, launchToken: null, status: "ready", error: null, registrationObserved: true });
+    });
+    expect(profileEnv(await store.read(), "env-guarded", "codex")).toEqual({});
+    await expect(restoreIntegration({
+      config: { get: async () => { throw new Error("config unavailable"); }, patch: vi.fn() },
+    } as unknown as PaseoApi, store, Date.now() - 1)).rejects.toThrow(/did not restore/i);
+    expect((await store.read()).integration.restorePending).toBe(true);
+    const restartedStore = new AccountStore(store.root);
+    const restoredWithOverride = { providers: { claude: { command: [process.execPath, cli] }, codex: { command: [process.execPath, cli], env: { OPENAI_API_KEY: "override" } } } };
+    await expect(reconcileIntegration({ config: { get: async () => ({ config: restoredWithOverride }) } } as unknown as PaseoApi, restartedStore)).rejects.toThrow(/Could not verify Paseo provider commands/);
+    const afterRestart = await restartedStore.read();
+    expect(afterRestart.integration.enabled).toBe(false);
+    expect(afterRestart.integration.restorePending).toBeUndefined();
+    expect(afterRestart.bindings.find(b => b.agentId === "keep-healthy")).toMatchObject({ currentAccountId: null, pendingAccountId: "managed-3", launchAccountId: "managed-2", launchToken: null, status: "error" });
   });
 
   it.each([

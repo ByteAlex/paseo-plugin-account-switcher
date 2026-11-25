@@ -37,9 +37,22 @@ vi.mock("../server/auth", () => ({
 }));
 vi.mock("../server/integration", () => ({
   writeLaunchers: async () => {}, prepareRuntime: mocks.prepareRuntime, reconcileIntegration: mocks.reconcileIntegration,
-  installIntegration: async () => {}, restoreIntegration: async () => {},
+  installIntegration: async () => {},
+  restoreIntegration: async (_paseo: unknown, store: AccountStore) => {
+    await store.change(r => {
+      r.integration = { ...r.integration, enabled: false, error: null, restorePending: undefined };
+      for (const b of r.bindings) {
+        b.launchToken = null;
+        if (b.currentAccountId !== `system-${b.provider}`) {
+          b.pendingAccountId = b.pendingAccountId ?? b.currentAccountId ?? b.launchAccountId;
+          b.currentAccountId = null; b.status = "error";
+          b.error = "Integration is disabled. The next reload will use the system CLI.";
+        }
+      }
+    });
+  },
 }));
-vi.mock("../server/profiles", () => ({ prepareProfile: async () => {} }));
+vi.mock("../server/profiles", () => ({ prepareProfile: async () => {}, assertManagedCommand: async () => {} }));
 vi.mock("../server/usage", () => ({ createUsageService: () => mocks.usage, readCredentialVersion: async () => "fixture-version" }));
 vi.mock("../server/usage/claude", () => ({ renewExpiredClaudeToken: mocks.renewExpiredClaudeToken }));
 
@@ -425,12 +438,19 @@ describe("deleted agent reconciliation", () => {
       expect((await controller.store.read()).bindings[0]).toMatchObject({ agentId: "failed-agent", registrationObserved: false });
     });
 
-    it("keeps the binding when the agent list is incomplete", async () => {
+    it("keeps the binding when the agent lookup interface is unavailable", async () => {
       const { controller, account } = await failedStart();
       tenMinutesLater();
-      const offline = { agents: { ...paseo.agents, list: async () => { throw new Error("offline"); } } } as unknown as PaseoApi;
+      const offline = { agents: {} } as unknown as PaseoApi;
       await expect(controller.remove(account.id, offline)).rejects.toThrow(/used by an agent/);
       expect((await controller.store.read()).bindings.map(b => b.agentId)).toEqual(["failed-agent"]);
+    });
+
+    it("records positive registration during the creation grace period when a poll observes the agent", async () => {
+      const { controller } = await failedStart();
+      const alive = { agents: { ref: () => ({ refresh: async () => ({ agent: { id: "failed-agent", status: "idle" } }) }) } } as unknown as PaseoApi;
+      await controller.snapshot(alive);
+      expect((await controller.store.read()).bindings[0]).toMatchObject({ agentId: "failed-agent", registrationObserved: true });
     });
   });
 
@@ -443,50 +463,497 @@ describe("deleted agent reconciliation", () => {
     expect((await controller.store.read()).bindings.map(b => b.agentId)).toEqual(["background-agent"]);
   });
 
-  it("releases deleted-agent bindings for login while retaining archived agents across every page", async () => {
+  it("releases deleted-agent bindings for login while retaining archived agents and skipping unrelated accounts", async () => {
     const { controller, account } = await fixture();
     await controller.store.prepare("deleted-agent", "codex", account.id);
     await controller.store.change(r => { r.bindings[0].currentAccountId = account.id; r.bindings[0].launchAccountId = account.id; });
-    await controller.store.prepare("archived-agent", "codex", "system-codex");
-    const list = vi.fn().mockResolvedValueOnce(completeAgentPage(["active-agent"], "second-page")).mockResolvedValueOnce(completeAgentPage(["archived-agent"]));
-    const host = { agents: { ...paseo.agents, ...goneAgents, list } } as unknown as PaseoApi;
+    await controller.store.prepare("unrelated-agent", "codex", "system-codex");
+    const list = vi.fn();
+    const ref = vi.fn((id: string) => ({
+      refresh: async () => id === "unrelated-agent" ? { agent: { id, archivedAt: "2026-09-16T00:00:00Z" } } : null,
+    }));
+    const host = { agents: { ...paseo.agents, list, ref } } as unknown as PaseoApi;
     await expect(controller.login(host, account.id)).resolves.toMatchObject({ terminalId: "login-terminal" });
-    expect((await controller.store.read()).bindings.map(b => b.agentId)).toEqual(["archived-agent"]);
-    expect(list).toHaveBeenNthCalledWith(1, { filter: { includeArchived: true }, page: { limit: 200 } });
-    expect(list).toHaveBeenNthCalledWith(2, { filter: { includeArchived: true }, page: { limit: 200, cursor: "second-page" } });
+    expect((await controller.store.read()).bindings.map(b => b.agentId)).toEqual(["unrelated-agent"]);
+    expect(list).not.toHaveBeenCalled();
+    expect(ref).toHaveBeenCalledTimes(1);
+    expect(ref).toHaveBeenCalledWith("deleted-agent");
   });
 
   it("lets the removal RPC path clear a deleted binding but protects an archived binding", async () => {
     const { controller, account } = await fixture();
     await controller.store.prepare("deleted-agent", "codex", account.id);
-    const host = { agents: { ...paseo.agents, ...goneAgents, list: async () => completeAgentPage([]) } } as unknown as PaseoApi;
+    const host = { agents: { ...paseo.agents, ...goneAgents } } as unknown as PaseoApi;
     await controller.remove(account.id, host);
     expect((await controller.store.read()).accounts.some(a => a.id === account.id)).toBe(false);
     const archivedAccount = await controller.store.add("codex", "Archived owner");
     await controller.store.prepare("archived-agent", "codex", archivedAccount.id);
-    const archivedHost = { agents: { ...paseo.agents, list: async () => completeAgentPage(["archived-agent"]) } } as unknown as PaseoApi;
+    const archivedHost = {
+      agents: {
+        ref: (id: string) => ({ refresh: async () => ({ agent: { id, archivedAt: "2026-09-16T00:00:00Z" } }) }),
+      },
+    } as unknown as PaseoApi;
     await expect(controller.remove(archivedAccount.id, archivedHost)).rejects.toThrow(/used by an agent/);
   });
 
-  it.each(["request error", "missing page cursor", "repeated page cursor", "duplicate entries"])("retains every binding after an incomplete listing: %s", async failure => {
-    const { controller, account } = await fixture(); await controller.store.prepare("protected-agent", "codex", account.id);
-    const list = vi.fn();
-    if (failure === "request error") list.mockResolvedValueOnce(completeAgentPage([], "next")).mockRejectedValueOnce(new Error("offline"));
-    else if (failure === "missing page cursor") list.mockResolvedValue({ entries: [], pageInfo: { hasMore: true, nextCursor: null } });
-    else if (failure === "duplicate entries") list.mockResolvedValueOnce(completeAgentPage(["duplicate"], "next")).mockResolvedValueOnce(completeAgentPage(["duplicate"]));
-    else list.mockResolvedValue(completeAgentPage([], "same-page"));
-    await controller.snapshot({ agents: { ...paseo.agents, list } } as unknown as PaseoApi);
+  it("retains bindings whose lookup fails while still clearing confirmed-deleted siblings", async () => {
+    const { controller, account } = await fixture();
+    await controller.store.prepare("protected-agent", "codex", account.id);
+    await controller.store.prepare("deleted-agent", "codex", "system-codex");
+    const host = {
+      agents: {
+        ...paseo.agents,
+        ref: (id: string) => ({
+          refresh: async () => {
+            if (id === "protected-agent") throw new Error("offline");
+            return null;
+          },
+        }),
+      },
+    } as unknown as PaseoApi;
+    await controller.snapshot(host);
     expect((await controller.store.read()).bindings.map(b => b.agentId)).toEqual(["protected-agent"]);
   });
 
-  it("preserves bindings created while the full listing is in flight", async () => {
-    const { controller, account } = await fixture(); await controller.store.prepare("deleted-agent", "codex", account.id);
-    let finish!: (value: ReturnType<typeof completeAgentPage>) => void, started!: () => void;
+  it("preserves bindings created while reconciliation is in flight and deduplicates concurrent snapshot polls", async () => {
+    const { controller, account } = await fixture();
+    await controller.store.prepare("deleted-agent", "codex", account.id);
+    let finish!: (value: null) => void, started!: () => void;
     const entered = new Promise<void>(resolve => { started = resolve; });
-    const list = vi.fn(() => { started(); return new Promise<ReturnType<typeof completeAgentPage>>(resolve => { finish = resolve; }); });
-    const snapshot = controller.snapshot({ agents: { ...paseo.agents, ...goneAgents, list } } as unknown as PaseoApi);
-    await entered; await controller.store.prepare("new-agent", "codex", account.id); finish(completeAgentPage([])); await snapshot;
+    const refresh = vi.fn(() => { started(); return new Promise<null>(resolve => { finish = resolve; }); });
+    const host = { agents: { ...paseo.agents, ref: () => ({ refresh }) } } as unknown as PaseoApi;
+    const first = controller.snapshot(host);
+    await entered;
+    const second = controller.snapshot(host);
+    await controller.store.prepare("new-agent", "codex", account.id);
+    finish(null);
+    await Promise.all([first, second]);
+    expect(refresh).toHaveBeenCalledTimes(1);
     expect((await controller.store.read()).bindings.map(b => b.agentId)).toEqual(["new-agent"]);
+  });
+
+  it("does not lose an observeAgentRegistration invalidation that arrives during an in-flight reconciliation", async () => {
+    const { controller, account } = await fixture();
+    await controller.store.change(r => { r.integration.enabled = true; });
+    await controller.setDefault("codex", account.id);
+    await controller.switcher(paseo).bindNewAgent("creating-agent", "codex");
+    await controller.store.prepare("other-agent", "codex", "system-codex");
+    let finish!: () => void, started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    let firstPass = true;
+    const ref = vi.fn((id: string) => ({
+      refresh: async () => {
+        if (firstPass && id === "creating-agent") {
+          started();
+          await new Promise<void>(resolve => { finish = resolve; });
+          return null;
+        }
+        return id === "other-agent" ? { agent: { id, status: "idle" } } : null;
+      },
+    }));
+    const host = { agents: { ref } } as unknown as PaseoApi;
+    const pending = controller.snapshot(host);
+    await entered;
+    await controller.observeAgentRegistration("creating-agent");
+    finish();
+    await pending;
+    firstPass = false;
+    // The invalidation was not clobbered by the finishing first pass, so the next snapshot immediately reconciles.
+    await controller.snapshot(host);
+    expect((await controller.store.read()).bindings.map(b => b.agentId)).toEqual(["other-agent"]);
+  });
+
+  it("throttles repeated snapshot reconciliations, recovers after cooldown or clock step-back, and lets remove run scoped without waiting for slow polls", async () => {
+    const { controller, account } = await fixture();
+    const other = await controller.store.add("codex", "Other");
+    await controller.store.prepare("slow-agent", "codex", other.id);
+    await controller.store.prepare("target-agent", "codex", account.id);
+    let releaseSlow!: () => void, slowStarted!: () => void;
+    const enteredSlow = new Promise<void>(resolve => { slowStarted = resolve; });
+    let slowMode = true;
+    const ref = vi.fn((id: string) => ({
+      refresh: async () => {
+        if (id === "slow-agent" && slowMode) {
+          slowStarted();
+          await new Promise<void>(resolve => { releaseSlow = resolve; });
+          return { agent: { id, status: "idle" } };
+        }
+        return id === "slow-agent" ? { agent: { id, status: "idle" } } : null;
+      },
+    }));
+    const host = { agents: { ref } } as unknown as PaseoApi;
+    const poll = controller.snapshot(host);
+    await enteredSlow;
+    // Removing `account` checks only `target-agent` and completes immediately even while `poll` is still stuck on `slow-agent`.
+    await controller.remove(account.id, host);
+    expect((await controller.store.read()).accounts.some(a => a.id === account.id)).toBe(false);
+    releaseSlow();
+    await poll;
+    slowMode = false;
+    const callsAfterPoll = ref.mock.calls.length;
+    await controller.snapshot(host);
+    expect(ref.mock.calls.length).toBe(callsAfterPoll);
+    // Advancing past RECONCILE_INTERVAL or stepping the clock backward re-enables polling reconciliation.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 61_000);
+      await controller.snapshot(host);
+      expect(ref.mock.calls.length).toBeGreaterThan(callsAfterPoll);
+      const callsAfterCooldown = ref.mock.calls.length;
+      vi.setSystemTime(Date.now() - 120_000);
+      await controller.snapshot(host);
+      expect(ref.mock.calls.length).toBeGreaterThan(callsAfterCooldown);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds per-binding lookup concurrency and deduplicates probes across concurrent background and scoped passes", async () => {
+    const { controller, account } = await fixture();
+    await controller.store.prepare("shared-agent", "codex", account.id);
+    for (let i = 0; i < 8; i++) await controller.store.prepare(`agent-${i}`, "codex", "system-codex");
+    let active = 0, peak = 0, sharedCalls = 0;
+    const host = {
+      agents: {
+        ref: (id: string) => ({
+          refresh: async () => {
+            if (id === "shared-agent") sharedCalls++;
+            active++;
+            peak = Math.max(peak, active);
+            await new Promise(resolve => setTimeout(resolve, 15));
+            active--;
+            return id === "shared-agent" ? null : { agent: { id, status: "idle" } };
+          },
+        }),
+      },
+    } as unknown as PaseoApi;
+    await Promise.all([controller.snapshot(host), controller.remove(account.id, host)]);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(4);
+    expect(sharedCalls).toBe(1);
+  });
+
+  it("does not reuse a pre-registration probe null to delete a newly registered binding during forced removal", async () => {
+    const { controller, account } = await fixture();
+    await controller.store.change(r => { r.integration.enabled = true; });
+    await controller.setDefault("codex", account.id);
+    await controller.switcher(paseo).bindNewAgent("racing-agent", "codex");
+    let resolveStale!: (value: null) => void, staleStarted!: () => void;
+    const enteredStale = new Promise<void>(resolve => { staleStarted = resolve; });
+    let calls = 0;
+    const host = {
+      agents: {
+        ref: (id: string) => ({
+          refresh: () => {
+            calls++;
+            if (calls === 1) {
+              staleStarted();
+              return new Promise<null>(resolve => { resolveStale = resolve; });
+            }
+            return Promise.resolve({ agent: { id, status: "idle" } });
+          },
+        }),
+      },
+    } as unknown as PaseoApi;
+    const bgPoll = controller.snapshot(host);
+    await enteredStale;
+    await controller.observeAgentRegistration("racing-agent");
+    // Forced removal must issue a fresh probe instead of joining the pre-registration probe that resolves to null.
+    await expect(controller.remove(account.id, host)).rejects.toThrow(/used by an agent/);
+    resolveStale(null);
+    await bgPoll;
+    expect(calls).toBe(2);
+    expect((await controller.store.read()).bindings.map(b => b.agentId)).toEqual(["racing-agent"]);
+  });
+
+  it("does not reuse a pre-confirmation probe null after confirmLaunch confirms the binding", async () => {
+    const { controller, account } = await fixture();
+    await controller.store.change(r => { r.integration.enabled = true; });
+    await controller.setDefault("codex", account.id);
+    await controller.switcher(paseo).bindNewAgent("confirmed-agent", "codex");
+    const token = (await controller.store.read()).bindings[0].launchToken!;
+    await mkdir(join(controller.store.root, "receipts"), { recursive: true });
+    await writeFile(join(controller.store.root, "receipts", "confirmed-agent.json"), JSON.stringify({ accountId: account.id, launchToken: token }));
+    let resolveStale!: (value: null) => void, staleStarted!: () => void;
+    const enteredStale = new Promise<void>(resolve => { staleStarted = resolve; });
+    let calls = 0;
+    const host = {
+      agents: {
+        ref: (id: string) => ({
+          refresh: () => {
+            calls++;
+            if (calls === 1) {
+              staleStarted();
+              return new Promise<null>(resolve => { resolveStale = resolve; });
+            }
+            return Promise.resolve({ agent: { id, status: "idle" } });
+          },
+        }),
+      },
+    } as unknown as PaseoApi;
+    const bgPoll = controller.snapshot(host);
+    await enteredStale;
+    expect(await controller.accountOf(host, "confirmed-agent", "codex")).toBe(account.id);
+    // Forced removal after confirmLaunch must not reuse the pre-confirmation probe that resolves to null.
+    await expect(controller.remove(account.id, host)).rejects.toThrow(/used by an agent/);
+    resolveStale(null);
+    await bgPoll;
+    expect((await controller.store.read()).bindings[0]).toMatchObject({ agentId: "confirmed-agent", currentAccountId: account.id });
+  });
+
+  it("holds true daemon concurrency at 4 while stalled lookups remain pending and aborts queued forced lookups at the forced deadline", async () => {
+    const { controller, account } = await fixture();
+    for (let i = 0; i < 9; i++) await controller.store.prepare(`hung-${i}`, "codex", account.id);
+    const dispatched: string[] = [];
+    const resolvers = new Map<string, (value: null) => void>();
+    const host = {
+      agents: {
+        ref: (id: string) => ({
+          refresh: () => {
+            dispatched.push(id);
+            return new Promise<null>(resolve => { resolvers.set(id, resolve); });
+          },
+        }),
+      },
+    } as unknown as PaseoApi;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const removal = controller.remove(account.id, host);
+      const outcome = removal.then(() => "ok", (error: Error) => error.message);
+      await vi.waitFor(() => expect(dispatched).toHaveLength(4));
+      // Even past PROBE_TIMEOUT_MS (5s), the 4 unresolved daemon requests still hold their slots so the daemon is not flooded.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(dispatched).toHaveLength(4);
+      // At 8s total, the forced pass hits FORCE_RECONCILE_TIMEOUT_MS, rejects, and drains queued waiters.
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(await outcome).toMatch(/Could not verify whether agents still use this account in time/);
+      // When the 4 original daemon requests later settle to null, no queued lookups are dispatched and nothing is deleted.
+      for (const resolve of resolvers.values()) resolve(null);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(dispatched).toHaveLength(4);
+      expect(mocks.removeAccountCredentials).not.toHaveBeenCalled();
+      expect((await controller.store.read()).accounts.some(a => a.id === account.id)).toBe(true);
+      expect((await controller.store.read()).bindings).toHaveLength(9);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds waiting on an in-flight credential check during startLogin so sign-in does not start past the RPC deadline", async () => {
+    const { controller, account } = await fixture();
+    let probeStarted!: () => void;
+    const enteredProbe = new Promise<void>(resolve => { probeStarted = resolve; });
+    mocks.probeAccount.mockImplementationOnce(() => { probeStarted(); return new Promise(() => {}); });
+    const pendingCheck = controller.checkAccount(account.id);
+    void pendingCheck.catch(() => {});
+    await enteredProbe;
+    let waitingForCheck!: () => void;
+    const enteredWait = new Promise<void>(resolve => { waitingForCheck = resolve; });
+    mocks.usage.invalidate.mockImplementationOnce(() => { waitingForCheck(); });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const signIn = controller.startLogin(paseo, account.id);
+      const outcome = signIn.then(() => "ok", (error: Error) => error.message);
+      await enteredWait;
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await outcome).toMatch(/account check is still in progress/i);
+      expect(accountFrom(await controller.store.read(), account.id).loginToken).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns snapshot promptly when a multi-batch background reconciliation exceeds its wait budget", async () => {
+    const { controller, account } = await fixture();
+    for (let i = 0; i < 5; i++) await controller.store.prepare(`slow-${i}`, "codex", account.id);
+    const resolvers = new Map<string, (value: null) => void>();
+    const host = {
+      agents: {
+        ref: (id: string) => ({
+          refresh: () => new Promise<null>(resolve => { resolvers.set(id, resolve); }),
+        }),
+      },
+    } as unknown as PaseoApi;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const snap = controller.snapshot(host);
+      await vi.waitFor(() => expect(resolvers.size).toBe(4));
+      // Batch 1 finishes at 3s (below the 5s per-probe timeout); batch 2 (5th agent) starts at 3s.
+      await vi.advanceTimersByTimeAsync(3_000);
+      for (const id of ["slow-0", "slow-1", "slow-2", "slow-3"]) resolvers.get(id)!(null);
+      await vi.waitFor(() => expect(resolvers.has("slow-4")).toBe(true));
+      // At 5s total, snapshot() hits SNAPSHOT_RECONCILE_WAIT_MS and returns promptly while batch 2 is still in flight.
+      await vi.advanceTimersByTimeAsync(2_000);
+      const state = await snap;
+      expect(state.bindings).toHaveLength(5);
+      // Batch 2 finishes cleanly at 6s (3s into its own probe) and removes all 5 deleted bindings in the background.
+      resolvers.get("slow-4")!(null);
+      await vi.waitFor(async () => expect((await controller.store.read()).bindings).toEqual([]));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("deduplicates concurrent ensureRuntime integration checks", async () => {
+    const { controller } = await fixture();
+    let release!: () => void;
+    mocks.reconcileIntegration.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    const first = controller.ensureRuntime(paseo);
+    const second = controller.ensureRuntime(paseo);
+    await vi.waitFor(() => expect(mocks.reconcileIntegration).toHaveBeenCalledTimes(1));
+    release();
+    await Promise.all([first, second]);
+    expect(mocks.reconcileIntegration).toHaveBeenCalledTimes(1);
+    await controller.ensureRuntime(paseo);
+    expect(mocks.reconcileIntegration).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds snapshot launch confirmation when all semaphore slots are stalled and evicts timed-out queued probes", async () => {
+    const { controller, account } = await fixture();
+    await controller.store.change(r => { r.integration.enabled = true; });
+    for (let i = 0; i < 4; i++) await controller.store.prepare(`stalled-${i}`, "codex", account.id);
+    await controller.store.change(r => {
+      r.bindings.push({ agentId: "confirm-me", provider: "codex", currentAccountId: null, pendingAccountId: null, launchAccountId: account.id, launchToken: "tok-c", status: "ready", error: null, registrationObserved: false, boundAt: new Date().toISOString() });
+    });
+    const other = await controller.add("codex", "Other");
+    await controller.store.prepare("queued-target", "codex", other.id);
+    await mkdir(join(controller.store.root, "receipts"), { recursive: true });
+    await writeFile(join(controller.store.root, "receipts", "confirm-me.json"), JSON.stringify({ accountId: account.id, launchToken: "tok-c" }));
+    const dispatched: string[] = [];
+    const resolvers = new Map<string, (value: null) => void>();
+    let fourReady!: () => void;
+    const allFourDispatched = new Promise<void>(resolve => { fourReady = resolve; });
+    const host = {
+      agents: {
+        ref: (id: string) => ({
+          refresh: () => {
+            dispatched.push(id);
+            if (dispatched.length === 4) fourReady();
+            return new Promise<null>(resolve => { resolvers.set(id, resolve); });
+          },
+        }),
+      },
+    } as unknown as PaseoApi;
+    const realSetTimeout = globalThis.setTimeout;
+    const pauseReal = (ms = 20) => new Promise<void>(resolve => { realSetTimeout(resolve, ms); });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const snap = controller.snapshot(host);
+      await allFourDispatched;
+      // At 5s, snapshot's reconciliation wait ends (and queued probe for confirm-me times out & is evicted);
+      // snapshot reads the receipt and enters confirmLaunch while all 4 stalled probes still hold their slots.
+      await vi.advanceTimersByTimeAsync(5_000);
+      await pauseReal();
+      // At 10s, snapshot's shared confirmation deadline expires and snapshot() returns without hanging.
+      await vi.advanceTimersByTimeAsync(5_000);
+      const state = await snap;
+      expect(state.bindings.find(b => b.agentId === "confirm-me")?.currentAccountId).toBeNull();
+      // Also run a forced removal on a single binding while all 4 slots are still held: it hits the 5s per-probe timeout
+      // (before the 8s outer timeout) and must evict its queued waiter so no abandoned lookup reaches the daemon.
+      const removal = controller.remove(other.id, host).then(() => "ok", (error: Error) => error.message);
+      await pauseReal();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await removal).toMatch(/used by an agent/i);
+      // When the 4 stalled probes settle, neither confirm-me nor queued-target is dispatched as a zombie lookup.
+      for (const resolve of resolvers.values()) resolve(null);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(dispatched).toEqual(["stalled-0", "stalled-1", "stalled-2", "stalled-3"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects startLogin before launching the CLI when the shared RPC deadline expires", async () => {
+    const { controller, account } = await fixture();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const deadline = Date.now() + 1_000;
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(controller.startLogin(paseo, account.id, "device", deadline)).rejects.toThrow(/in time|too long/i);
+      expect(accountFrom(await controller.store.read(), account.id).loginToken).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds slow reconcileLogins in snapshot and does not delete credentials in remove when store.queue stalls past deadline", async () => {
+    const { controller, account } = await fixture();
+    await controller.store.change(r => {
+      const a = accountFrom(r, account.id);
+      a.loginToken = "tok-slow-login";
+      a.login = { workspaceId: "ws", terminalId: "term" };
+    });
+    await mkdir(join(controller.store.root, "logins"), { recursive: true });
+    await writeFile(join(controller.store.root, "logins", `${account.id}.json`), JSON.stringify({ loginToken: "tok-slow-login", exitCode: 0 }));
+    let probeStarted!: () => void;
+    const enteredProbe = new Promise<void>(resolve => { probeStarted = resolve; });
+    mocks.probeAccount.mockImplementationOnce(() => { probeStarted(); return new Promise(() => {}); });
+    const realSetTimeout = globalThis.setTimeout;
+    const pauseReal = (ms = 20) => new Promise<void>(resolve => { realSetTimeout(resolve, ms); });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const snap = controller.snapshot(paseo);
+      await enteredProbe;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(snap).resolves.toMatchObject({ accounts: expect.any(Array) });
+      // Also verify remove() refuses inside store.remove if store.queue was held past deadlineMs.
+      const removable = await controller.add("codex", "Removable");
+      let releaseQueue!: () => void;
+      const blocker = controller.store.change(() => new Promise<void>(resolve => { releaseQueue = resolve; }));
+      const deadline = Date.now() + 1_000;
+      const removal = controller.remove(removable.id, paseo, deadline).then(() => "ok", (error: Error) => error.message);
+      await pauseReal();
+      await vi.advanceTimersByTimeAsync(1_500);
+      releaseQueue();
+      await blocker;
+      expect(await removal).toMatch(/in time/i);
+      expect(mocks.removeAccountCredentials).not.toHaveBeenCalled();
+      expect((await controller.store.read()).accounts.some(a => a.id === removable.id)).toBe(true);
+      // Once removeAccountCredentials has started before the deadline, passing the deadline during deletion must NOT report a verification timeout or skip cache invalidation.
+      let releaseCreds!: () => void, credsEntered!: () => void;
+      const enteredCreds = new Promise<void>(resolve => { credsEntered = resolve; });
+      mocks.removeAccountCredentials.mockImplementationOnce(() => { credsEntered(); return new Promise<void>(resolve => { releaseCreds = resolve; }); });
+      const activeRemoval = controller.remove(removable.id, paseo, Date.now() + 1_000);
+      await enteredCreds;
+      await vi.advanceTimersByTimeAsync(2_000);
+      releaseCreds();
+      await activeRemoval;
+      expect(mocks.usage.invalidate).toHaveBeenCalledWith(removable.id);
+      expect((await controller.store.read()).accounts.some(a => a.id === removable.id)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("advances store registrationEpoch on store.prepare so forced removal cannot reuse an older null probe", async () => {
+    const { controller, account } = await fixture();
+    await controller.store.change(r => {
+      r.bindings.push({ agentId: "prep-agent", provider: "codex", currentAccountId: null, pendingAccountId: null, launchAccountId: account.id, launchToken: "tok-prep", status: "ready", error: null, registrationObserved: false, boundAt: new Date().toISOString() });
+    });
+    let resolveStale!: (value: null) => void;
+    let calls = 0;
+    const host = {
+      agents: {
+        ref: () => ({
+          refresh: () => {
+            calls++;
+            if (calls === 1) return new Promise<null>(resolve => { resolveStale = resolve; });
+            return Promise.resolve({ agent: { provider: "codex", status: "idle", activeTurn: null, pendingPermissions: [], archivedAt: null } });
+          },
+        }),
+      },
+    } as unknown as PaseoApi;
+    const poll = controller.snapshot(host);
+    await vi.waitFor(() => expect(calls).toBe(1));
+    await controller.store.prepare("prep-agent", "codex", account.id);
+    const removalOutcome = controller.remove(account.id, host).then(() => "ok", (error: Error) => error.message);
+    await vi.waitFor(() => expect(calls).toBe(2));
+    resolveStale(null);
+    expect(await removalOutcome).toMatch(/used by an agent/i);
+    await poll;
+    expect((await controller.store.read()).bindings.find(b => b.agentId === "prep-agent")).toBeTruthy();
   });
 });
 

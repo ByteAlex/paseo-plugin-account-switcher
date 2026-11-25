@@ -29,6 +29,52 @@ const RENEWAL_INTERVAL=600000;
 // A new agent's binding is written before its CLI starts, and Paseo reports no failed creation. This covers the time until the
 // CLI reads the binding, where each plugin hook gets 30 seconds; from then on the launcher's receipt says whether that CLI still runs.
 const CREATION_WAIT=600000;
+// Deleted-agent reconciliation runs at most once per interval during UI polling, with bounded concurrency per bound agent
+// instead of paginating every archived agent on the daemon. Explicit login/remove actions always force a fresh scoped pass.
+const RECONCILE_INTERVAL=60_000;
+const RECONCILE_CONCURRENCY=4;
+const SNAPSHOT_RECONCILE_WAIT_MS=5_000;
+const SNAPSHOT_CONFIRM_WAIT_MS=5_000;
+// Bound each individual agent lookup, each forced login/remove reconciliation, and end-to-end RPC preparation so even
+// cold-start ensureRuntime + forced checks + watchdog startup stay strictly under Paseo's 30s plugin RPC timeout.
+const PROBE_TIMEOUT_MS=5_000;
+const FORCE_RECONCILE_TIMEOUT_MS=8_000;
+const RPC_BUDGET_MS=20_000;
+// Pre-deletion verification + queue budget for remove() leaves 20s of headroom under Paseo's 30s RPC timeout
+// for the 5s Keychain deletion, profile directory cleanup, and registry commit.
+const REMOVE_START_BUDGET_MS=10_000;
+type ProbeSignal={aborted:boolean;listeners?:Set<()=>void>};
+function abortSignal(signal:ProbeSignal):void{
+ if(signal.aborted)return;
+ signal.aborted=true;
+ const listeners=signal.listeners;
+ signal.listeners=undefined;
+ if(listeners)for(const listener of listeners)listener();
+}
+function raceTimeout<T>(promise:Promise<T>,ms:number,error:string|(()=>Error),signal?:ProbeSignal):Promise<T>{
+ void promise.catch(()=>{});
+ const makeError=()=>typeof error==="string"?new Error(error):error();
+ if(signal?.aborted||ms<=0)return Promise.reject(makeError());
+ let timer:ReturnType<typeof setTimeout>|undefined;
+ let onAbort:(()=>void)|undefined;
+ const cleanup=()=>{
+  if(timer){clearTimeout(timer);timer=undefined;}
+  if(onAbort&&signal?.listeners){signal.listeners.delete(onAbort);onAbort=undefined;}
+ };
+ return new Promise<T>((resolve,reject)=>{
+  timer=setTimeout(()=>{cleanup();reject(makeError());},ms);
+  timer.unref?.();
+  if(signal){
+   onAbort=()=>{cleanup();reject(makeError());};
+   (signal.listeners??=new Set()).add(onAbort);
+  }
+  promise.then(
+   value=>{cleanup();resolve(value);},
+   err=>{cleanup();reject(err);},
+  );
+ });
+}
+type ProbeEntry={epoch:number;promise:Promise<boolean|undefined>;signal:ProbeSignal;callers:number;dispatched:boolean};
 // Agent statuses that show a launch got under way, for the receipt check: the Accounts list waits for a session that is
 // up. Failover also takes "error", which Paseo sets when a turn fails, before the plugin's turn_ended hook runs: the
 // launcher wrote the receipt when it started the CLI, so the receipt still names the account the agent started on.
@@ -44,6 +90,14 @@ export class AccountController {
  private readonly switches=new Map<PaseoApi,SwitchService>();
  private readonly applying=new Set<string>();
  private runtimeReady:Promise<void>|undefined;
+ private readonly integrationReconciles=new WeakMap<PaseoApi,Promise<void>>();
+ private reconcileInFlight:Promise<void>|undefined;
+ private loginReconcileInFlight:Promise<void>|undefined;
+ private lastReconcileAt=-Infinity;
+ private reconcileEpoch=0;
+ private readonly agentProbes=new WeakMap<PaseoApi,Map<string,ProbeEntry>>();
+ private activeProbes=0;
+ private readonly probeWaiters:{resolve:(acquired:boolean)=>void;isAborted?:()=>boolean;allowDisposed?:boolean}[]=[];
  private readonly quotaFlights=new Map<string,Promise<QuotaAccount[]>>();
  private integrationChanging=false;
  private readonly startingLogins=new Set<string>();
@@ -60,30 +114,83 @@ export class AccountController {
   this.usage=createUsageService({getAccounts:input=>this.quotaAccounts(input),cachePath:join(root,"usage-cache.json"),checksEnabled:()=>usageChecksEnabled(join(dirname(root),"config.json"))});
   void this.ready.then(()=>{if(!this.disposed)this.usage.start();}).catch(()=>{});
  }
- async ensureRuntime(paseo:PaseoApi){
+ async ensureRuntime(paseo:PaseoApi,deadlineMs?:number){
   await this.ready;
-  if(!this.runtimeReady){this.runtimeReady=prepareRuntime(paseo,this.store).catch(error=>{this.runtimeReady=undefined;throw error;});}
-  await this.runtimeReady;
-  await reconcileIntegration(paseo,this.store);
+  const checkDeadline=()=>{if(deadlineMs!==undefined&&Date.now()>=deadlineMs)throw new Error("Timed out verifying Paseo provider integration. Try again.");};
+  checkDeadline();
+  if(!this.runtimeReady){
+   const prepare=deadlineMs===undefined?prepareRuntime(paseo,this.store):prepareRuntime(paseo,this.store,deadlineMs);
+   this.runtimeReady=prepare.catch(error=>{this.runtimeReady=undefined;throw error;});
+  }
+  await (deadlineMs===undefined?this.runtimeReady:raceTimeout(this.runtimeReady,deadlineMs-Date.now(),"Timed out verifying Paseo provider integration. Try again."));
+  checkDeadline();
+  const existing=this.integrationReconciles.get(paseo);
+  if(existing){
+   await (deadlineMs===undefined?existing:raceTimeout(existing,deadlineMs-Date.now(),"Timed out verifying Paseo provider integration. Try again."));
+   return;
+  }
+  const task=Promise.resolve().then(()=>deadlineMs===undefined?reconcileIntegration(paseo,this.store):reconcileIntegration(paseo,this.store,deadlineMs));
+  this.integrationReconciles.set(paseo,task);
+  try{
+   await (deadlineMs===undefined?task:raceTimeout(task,deadlineMs-Date.now(),"Timed out verifying Paseo provider integration. Try again."));
+  }finally{if(this.integrationReconciles.get(paseo)===task)this.integrationReconciles.delete(paseo);}
  }
  async snapshot(paseo:PaseoApi){
-  await this.ensureRuntime(paseo);
-  await this.reconcileDeletedAgents(paseo);
-  await this.reconcileLogins();
+  const deadline=Date.now()+RPC_BUDGET_MS;
+  await this.ensureRuntime(paseo,deadline);
+  await this.reconcileDeletedAgents(paseo,{maxWaitMs:Math.min(SNAPSHOT_RECONCILE_WAIT_MS,Math.max(0,deadline-Date.now()))});
+  await this.reconcileLogins(Math.min(SNAPSHOT_RECONCILE_WAIT_MS,Math.max(0,deadline-Date.now())));
   const state=await this.store.read();
-  for(const binding of state.bindings)await this.confirmLaunch(paseo,state,binding,STARTED);
+  const unconfirmed=state.bindings.filter(binding=>state.integration.enabled&&!this.integrationChanging&&binding.currentAccountId===null&&binding.status==="ready"&&!!binding.launchAccountId&&!!binding.launchToken);
+  const confirmBudget=Math.min(SNAPSHOT_CONFIRM_WAIT_MS,deadline-Date.now());
+  if(unconfirmed.length&&confirmBudget>0){
+   const confirmDeadline=Date.now()+confirmBudget;
+   const confirmSignal:ProbeSignal={aborted:false};
+   let timer:ReturnType<typeof setTimeout>|undefined;
+   const workersRun=(async()=>{
+    let cursor=0;
+    const workers=Math.min(RECONCILE_CONCURRENCY,unconfirmed.length);
+    await Promise.all(Array.from({length:workers},async()=>{
+     while(!confirmSignal.aborted){
+      const remaining=confirmDeadline-Date.now();
+      if(remaining<=0){abortSignal(confirmSignal);this.drainAbortedWaiters();return;}
+      const binding=unconfirmed[cursor++];
+      if(!binding)return;
+      await this.confirmLaunch(paseo,state,binding,STARTED,Math.min(PROBE_TIMEOUT_MS,remaining),confirmSignal);
+     }
+    }));
+   })();
+   void workersRun.catch(()=>{});
+   try{
+    await Promise.race([
+     workersRun,
+     new Promise<void>(resolve=>{timer=setTimeout(()=>{abortSignal(confirmSignal);this.drainAbortedWaiters();resolve();},confirmBudget);timer.unref?.();}),
+    ]);
+   }finally{if(timer)clearTimeout(timer);abortSignal(confirmSignal);this.drainAbortedWaiters();}
+  }
   return this.store.snapshot();
  }
  /** Confirms that an agent runs on the account it was launched on: the launcher's receipt names that account and launch,
   * and the agent's status is one of `started`. True once the binding records it as the agent's account. */
- private async confirmLaunch(paseo:PaseoApi,state:Registry,binding:StoredBinding,started:readonly string[]):Promise<boolean>{
-  if(!state.integration.enabled||this.integrationChanging||binding.currentAccountId!==null||binding.status!=="ready"||!binding.launchAccountId||!binding.launchToken)return false;
+ private async confirmLaunch(paseo:PaseoApi,state:Registry,binding:StoredBinding,started:readonly string[],timeoutMs=PROBE_TIMEOUT_MS,signal?:ProbeSignal):Promise<boolean>{
+  if(!state.integration.enabled||this.integrationChanging||binding.currentAccountId!==null||binding.status!=="ready"||!binding.launchAccountId||!binding.launchToken||signal?.aborted)return false;
   try{
    const receipt=JSON.parse(await readFile(join(this.store.root,"receipts",encodeURIComponent(binding.agentId)+".json"),"utf8"));
-   if(receipt.accountId!==binding.launchAccountId||receipt.launchToken!==binding.launchToken)return false;
-   const live=await paseo.agents.ref(binding.agentId).refresh();
+   if(receipt.accountId!==binding.launchAccountId||receipt.launchToken!==binding.launchToken||signal?.aborted)return false;
+   const live=await this.fetchAgentBounded(paseo,binding.agentId,timeoutMs,signal);
    if(!live||!started.includes(live.agent.status))return false;
-   return await this.store.change(r=>{const b=r.bindings.find(b=>b.agentId===binding.agentId);if(r.integration.enabled&&!this.integrationChanging&&b&&b.launchToken===binding.launchToken&&b.launchAccountId===binding.launchAccountId&&b.currentAccountId===null&&b.status==="ready"){b.currentAccountId=binding.launchAccountId;b.launchToken=null;b.registrationObserved=true;return true;}return false;});
+   return await this.store.change(r=>{
+    const b=r.bindings.find(b=>b.agentId===binding.agentId);
+    if(r.integration.enabled&&!this.integrationChanging&&b&&b.launchToken===binding.launchToken&&b.launchAccountId===binding.launchAccountId&&b.currentAccountId===null&&b.status==="ready"){
+     b.currentAccountId=binding.launchAccountId;
+     b.launchToken=null;
+     b.registrationObserved=true;
+     // Advance epoch inside store.change before atomic rename publishes the confirmed binding so no forced pass can reuse an older null probe.
+     this.reconcileEpoch++;
+     return true;
+    }
+    return false;
+   });
   }catch{/* The UI keeps the account unconfirmed until native startup succeeds. */return false;}
  }
  /** The account an agent runs on, for failover. A launch not confirmed yet is confirmed now by its receipt, the check
@@ -99,33 +206,177 @@ export class AccountController {
  }
  async observeAgentRegistration(agentId:string){
   await this.ready;
-  await this.store.change(r=>{const binding=r.bindings.find(b=>b.agentId===agentId);if(binding)binding.registrationObserved=true;});
+  const changed=await this.store.change(r=>{
+   const binding=r.bindings.find(b=>b.agentId===agentId);
+   if(!binding||binding.registrationObserved)return false;
+   binding.registrationObserved=true;
+   // Advance epoch before registry rename publishes registrationObserved so concurrent forced passes cannot join older null probes.
+   this.reconcileEpoch++;
+   return true;
+  });
+  if(changed)this.lastReconcileAt=-Infinity;
  }
- private async reconcileDeletedAgents(paseo:PaseoApi){
-  const before=await this.store.read();
-  if(!before.bindings.length)return;
-  const captured=new Map(before.bindings.map(binding=>[binding.agentId,JSON.stringify(binding)]));
-  const existing=new Set<string>(),cursors=new Set<string>();
-  let cursor:string|undefined,complete=false;
-  try{
-   for(let page=0;page<1000;page++){
-    const result=await paseo.agents.list({filter:{includeArchived:true},page:{limit:200,...(cursor?{cursor}:{})}});
-    if(!Array.isArray(result.entries)||typeof result.pageInfo?.hasMore!=="boolean")return;
-    for(const entry of result.entries){const id=entry.agent?.id;if(typeof id!=="string"||!id||existing.has(id))return;existing.add(id);}
-    if(!result.pageInfo.hasMore){if(result.pageInfo.nextCursor!==null)return;complete=true;break;}
-    const next=result.pageInfo.nextCursor;if(typeof next!=="string"||!next||cursors.has(next))return;cursors.add(next);cursor=next;
-   }
-  }catch{return;}
-  if(!complete)return;
-  // The list leaves agents out, those in background workspaces among them, so only Paseo's answer for the agent itself proves it is gone.
-  const now=Date.now(),gone=new Set<string>();
-  for(const binding of before.bindings){
-   if(existing.has(binding.agentId)||this.applying.has(binding.agentId)||binding.status==="switching")continue;
-   if(!binding.registrationObserved&&binding.currentAccountId===null&&!await this.creationOver(binding,now))continue;
-   const known=await paseo.agents.ref(binding.agentId).refresh().then(found=>!!found,()=>undefined);
-   if(known)existing.add(binding.agentId);else if(known===false)gone.add(binding.agentId);
+ private async acquireProbe(isAborted?:()=>boolean,priority=false,allowDisposed=false):Promise<boolean>{
+  if((!allowDisposed&&this.disposed)||isAborted?.())return false;
+  if(this.activeProbes<RECONCILE_CONCURRENCY){this.activeProbes++;return true;}
+  return new Promise<boolean>(resolve=>{
+   const waiter={resolve,isAborted,allowDisposed};
+   if(priority)this.probeWaiters.unshift(waiter);else this.probeWaiters.push(waiter);
+  });
+ }
+ private releaseProbe():void{
+  while(this.probeWaiters.length){
+   const next=this.probeWaiters.shift()!;
+   if((!next.allowDisposed&&this.disposed)||next.isAborted?.()){next.resolve(false);continue;}
+   next.resolve(true);
+   return;
   }
+  this.activeProbes--;
+ }
+ private drainAbortedWaiters():void{
+  for(let i=this.probeWaiters.length-1;i>=0;i--){
+   if((!this.probeWaiters[i].allowDisposed&&this.disposed)||this.probeWaiters[i].isAborted?.()){
+    const [removed]=this.probeWaiters.splice(i,1);
+    removed.resolve(false);
+   }
+  }
+ }
+ private async fetchAgentBounded(paseo:PaseoApi,agentId:string,timeoutMs=PROBE_TIMEOUT_MS,outerSignal?:ProbeSignal):Promise<Awaited<ReturnType<ReturnType<PaseoApi["agents"]["ref"]>["refresh"]>>|null>{
+  if(timeoutMs<=0||outerSignal?.aborted)return null;
+  const localSignal:ProbeSignal={aborted:false};
+  const isAborted=()=>localSignal.aborted||!!outerSignal?.aborted;
+  const attempt=(async()=>{
+   const acquired=await this.acquireProbe(isAborted,false,true);
+   if(!acquired)return null;
+   if(isAborted()){this.releaseProbe();return null;}
+   // Hold the semaphore slot until the underlying daemon request settles so local timeouts cannot flood the daemon.
+   const raw=Promise.resolve().then(()=>paseo.agents.ref(agentId).refresh());
+   void raw.then(()=>{this.releaseProbe();},()=>{this.releaseProbe();});
+   return raw;
+  })();
+  try{
+   return await raceTimeout(attempt,timeoutMs,"Timed out checking agent status.",outerSignal);
+  }catch(error){
+   abortSignal(localSignal);
+   this.drainAbortedWaiters();
+   throw error;
+  }
+ }
+ private async probeAgent(paseo:PaseoApi,agentId:string,options:{signal?:ProbeSignal;priority?:boolean;minEpoch?:number;timeoutMs?:number}={}):Promise<boolean|undefined>{
+  const timeoutMs=options.timeoutMs??PROBE_TIMEOUT_MS;
+  if(this.disposed||options.signal?.aborted||timeoutMs<=0)return undefined;
+  let map=this.agentProbes.get(paseo);
+  if(!map){map=new Map();this.agentProbes.set(paseo,map);}
+  const existing=map.get(agentId);
+  // Only reuse an active in-flight probe started at or after the caller's registration epoch so a stale pre-registration null
+  // can never be consumed by a forced pass started after observeAgentRegistration() or confirmLaunch().
+  let entry=existing&&!existing.signal.aborted&&(options.minEpoch===undefined||existing.epoch>=options.minEpoch)?existing:undefined;
+  if(!entry){
+   const probeEpoch=this.store.registrationEpoch;
+   const entrySignal:ProbeSignal={aborted:false};
+   let created!:ProbeEntry;
+   const promise=Promise.resolve().then(async()=>{
+    try{
+     const acquired=await this.acquireProbe(()=>entrySignal.aborted,options.priority);
+     if(!acquired)return undefined;
+     // Hold the semaphore slot until the real daemon request finishes so local timeouts never exceed RECONCILE_CONCURRENCY in flight.
+     try{
+      if(this.disposed||entrySignal.aborted)return undefined;
+      created.dispatched=true;
+      return await Promise.resolve().then(()=>paseo.agents.ref(agentId).refresh()).then(found=>!!found,()=>undefined);
+     }finally{this.releaseProbe();}
+    }finally{if(map.get(agentId)===created)map.delete(agentId);}
+   });
+   created={epoch:probeEpoch,promise,signal:entrySignal,callers:0,dispatched:false};
+   map.set(agentId,created);
+   entry=created;
+  }
+  entry.callers++;
+  try{
+   return await raceTimeout(entry.promise,timeoutMs,"Timed out checking agent status.",options.signal);
+  }catch{
+   return undefined;
+  }finally{
+   entry.callers--;
+   if(entry.callers===0&&!entry.dispatched){
+    abortSignal(entry.signal);
+    if(map.get(agentId)===entry)map.delete(agentId);
+    this.drainAbortedWaiters();
+   }
+  }
+ }
+ private async reconcileDeletedAgents(paseo:PaseoApi,options:{force?:boolean;accountId?:string;maxWaitMs?:number}={}):Promise<void>{
+  if(this.disposed)return;
+  if(options.force){
+   // Explicit login/remove actions check only the bindings referencing the target account so they never queue behind a slow full poll,
+   // and fail closed before Paseo's 30s RPC timeout so an expired request cannot mutate account state after the caller saw a timeout.
+   const budget=options.maxWaitMs===undefined?FORCE_RECONCILE_TIMEOUT_MS:Math.min(FORCE_RECONCILE_TIMEOUT_MS,options.maxWaitMs);
+   if(budget<=0)throw new Error("Could not verify whether agents still use this account in time. Try again.");
+   const signal:ProbeSignal={aborted:false};
+   const deadline=Date.now()+budget;
+   try{
+    await raceTimeout(this.runReconcileDeletedAgents(paseo,options.accountId,signal,true,deadline),budget,"Could not verify whether agents still use this account in time. Try again.");
+   }catch(error){abortSignal(signal);this.drainAbortedWaiters();throw error;}
+   return;
+  }
+  const elapsed=Date.now()-this.lastReconcileAt;
+  if(!this.reconcileInFlight&&elapsed>=0&&elapsed<RECONCILE_INTERVAL)return;
+  let task=this.reconcileInFlight;
+  if(!task){
+   const epoch=this.reconcileEpoch;
+   let run!:Promise<void>;
+   run=Promise.resolve().then(async()=>{
+    try{
+     if(this.disposed)return;
+     await this.runReconcileDeletedAgents(paseo);
+     if(!this.disposed&&this.reconcileEpoch===epoch)this.lastReconcileAt=Date.now();
+    }finally{if(this.reconcileInFlight===run)this.reconcileInFlight=undefined;}
+   });
+   this.reconcileInFlight=run;
+   task=run;
+  }
+  if(options.maxWaitMs===undefined){await task;return;}
+  // A slow reconciliation may outlive a single snapshot poll; keep it attached so a late rejection never crashes the subprocess.
+  void task.catch(()=>{});
+  if(options.maxWaitMs<=0)return;
+  let timer:ReturnType<typeof setTimeout>|undefined;
+  try{
+   await Promise.race([task,new Promise<void>(resolve=>{timer=setTimeout(resolve,options.maxWaitMs);timer.unref?.();})]);
+  }finally{if(timer)clearTimeout(timer);}
+ }
+ private async runReconcileDeletedAgents(paseo:PaseoApi,accountId?:string,signal?:ProbeSignal,priority=false,deadlineMs?:number):Promise<void>{
+  const before=await this.store.read();
+  if(!before.bindings.length||this.disposed||signal?.aborted||typeof paseo?.agents?.ref!=="function")return;
+  const scoped=accountId?before.bindings.filter(b=>b.currentAccountId===accountId||b.pendingAccountId===accountId||b.launchAccountId===accountId):before.bindings;
+  if(!scoped.length)return;
+  const minEpoch=this.store.registrationEpoch;
+  const captured=new Map(scoped.map(binding=>[binding.agentId,JSON.stringify(binding)]));
+  const now=Date.now(),existing=new Set<string>(),needsObserve=new Set<string>(),gone=new Set<string>();
+  const candidates=scoped.filter(binding=>!this.applying.has(binding.agentId)&&binding.status!=="switching");
+  let cursor=0;
+  const workers=Math.min(RECONCILE_CONCURRENCY,candidates.length);
+  await Promise.all(Array.from({length:workers},async()=>{
+   while(!this.disposed&&!signal?.aborted){
+    const binding=candidates[cursor++];
+    if(!binding)return;
+    const timeoutMs=deadlineMs===undefined?PROBE_TIMEOUT_MS:Math.min(PROBE_TIMEOUT_MS,deadlineMs-Date.now());
+    if(timeoutMs<=0)return;
+    // Query only the bound agents directly (deduplicated per registration epoch and globally concurrency-capped across passes).
+    const known=await this.probeAgent(paseo,binding.agentId,{signal,priority,minEpoch,timeoutMs});
+    if(this.disposed||signal?.aborted)return;
+    if(known){
+     existing.add(binding.agentId);
+     if(!binding.registrationObserved)needsObserve.add(binding.agentId);
+    }else if(known===false){
+     if(binding.registrationObserved||binding.currentAccountId!==null||await this.creationOver(binding,now))gone.add(binding.agentId);
+    }
+   }
+  }));
+  if(this.disposed||signal?.aborted)return;
+  const needsBoundAt=scoped.some(binding=>!binding.registrationObserved&&binding.currentAccountId===null&&!binding.boundAt);
+  if(!needsObserve.size&&!gone.size&&!needsBoundAt)return;
   await this.store.change(r=>{
+   if(this.disposed||signal?.aborted)return;
    r.bindings=r.bindings.filter(binding=>{
     if(existing.has(binding.agentId)){binding.registrationObserved=true;return true;}
     if(captured.get(binding.agentId)!==JSON.stringify(binding)||this.applying.has(binding.agentId)||binding.status==="switching")return true;
@@ -221,28 +472,42 @@ export class AccountController {
   try{const state=await this.store.read();await prepareProfile({provider,home:account.home,sourceHome:state.sourceHomes[provider],sourceEnvironment:state.sourceEnvironment[provider]});return AccountSchema.parse(account);}
   catch(error){await this.store.remove(account.id,async()=>{await rm(dirname(account.home),{recursive:true,force:true});});throw error;}
  }
- async login(paseo:PaseoApi,id:string,workspaceId?:string,mode?:"device"|"browser") {
+ async login(paseo:PaseoApi,id:string,workspaceId?:string,mode?:"device"|"browser",deadlineMs=Date.now()+RPC_BUDGET_MS) {
   await this.ready;
-  await this.reconcileDeletedAgents(paseo);
+  await this.reconcileDeletedAgents(paseo,{force:true,accountId:id,maxWaitMs:deadlineMs-Date.now()});
+  if(Date.now()>=deadlineMs)throw new Error("Account sign-in took too long to prepare. Try again.");
   if(this.startingLogins.has(id))throw new Error("Sign-in is already being prepared.");
   const token=randomUUID();
-  await this.store.change(state=>{const account=accountFrom(state,id);if(account.source!=="managed")throw new Error("Add a separate account for isolated sign-in.");if(account.loginToken)throw new Error("Sign-in is already open. Continue in the Paseo terminal.");if(state.bindings.some(b=>b.currentAccountId===id||b.launchAccountId===id||b.currentAccountId===null&&b.pendingAccountId===id))throw new Error("Switch agents away from this account before signing in again.");account.loginToken=token;account.login=null;});
-  this.usage.invalidate(id);
   this.startingLogins.add(id);
   try{
+   await raceTimeout(
+    this.store.change(state=>{if(Date.now()>=deadlineMs)throw new Error("Account sign-in took too long to prepare. Try again.");const account=accountFrom(state,id);if(account.source!=="managed")throw new Error("Add a separate account for isolated sign-in.");if(account.loginToken)throw new Error("Sign-in is already open. Continue in the Paseo terminal.");if(state.bindings.some(b=>b.currentAccountId===id||b.launchAccountId===id||b.currentAccountId===null&&b.pendingAccountId===id))throw new Error("Switch agents away from this account before signing in again.");account.loginToken=token;account.login=null;}),
+    deadlineMs-Date.now(),
+    "Account sign-in took too long to prepare. Try again.",
+   );
+   this.usage.invalidate(id);
    // A status probe started before the reservation must finish before the CLI
    // can replace credentials. Completion then always probes the new identity.
-   await this.checks.get(id)?.catch(()=>{});
+   const existingCheck=this.checks.get(id);
+   if(existingCheck)await raceTimeout(existingCheck.catch(()=>{}),Math.min(PROBE_TIMEOUT_MS,deadlineMs-Date.now()),"An account check is still in progress. Try signing in again shortly.");
+   if(Date.now()>=deadlineMs)throw new Error("Account sign-in took too long to prepare. Try again.");
    const session=await launchLogin(paseo,this.store,id,workspaceId,mode);
    await this.store.change(r=>{const a=accountFrom(r,id);if(a.loginToken===token)a.login=session;});
    return session;
-  }catch(error){await this.store.change(r=>{const a=accountFrom(r,id);if(a.loginToken===token){a.loginToken=null;a.login=null;}});throw error;}
+  }catch(error){
+   const clear=this.store.change(r=>{const a=r.accounts.find(a=>a.id===id);if(a?.loginToken===token){a.loginToken=null;a.login=null;}});
+   void clear.catch(()=>{});
+   const remaining=deadlineMs-Date.now();
+   if(remaining>0)await raceTimeout(clear,remaining,"Account sign-in took too long to prepare. Try again.").catch(()=>{});
+   throw error;
+  }
   finally{this.startingLogins.delete(id);}
  }
- async startLogin(paseo:PaseoApi,id:string,mode:"device"|"browser"="device"):Promise<LoginSession>{
+ async startLogin(paseo:PaseoApi,id:string,mode:"device"|"browser"="device",deadlineMs=Date.now()+RPC_BUDGET_MS):Promise<LoginSession>{
   await this.ready;
   if(this.disposed)throw new Error("Account sign-in is shutting down. Try again shortly.");
-  await this.reconcileDeletedAgents(paseo);
+  await this.reconcileDeletedAgents(paseo,{force:true,accountId:id,maxWaitMs:deadlineMs-Date.now()});
+  if(Date.now()>=deadlineMs)throw new Error("Account sign-in took too long to prepare. Try again.");
   if(this.startingLogins.has(id))throw new Error("Sign-in is already being prepared.");
   this.startingLogins.add(id);
   const token=randomUUID();
@@ -251,14 +516,26 @@ export class AccountController {
    if(account.loginToken)throw new Error("Sign-in is already open. Continue or cancel the current attempt.");
    if(account.source!=="managed")throw new Error("Add a separate account for isolated sign-in.");
    return await this.logins.start(account,registry,this.store.root,token,mode,async()=>{
-    await this.store.change(state=>{const current=accountFrom(state,id);if(current.loginToken)throw new LoginRefusal("Sign-in is already open. Continue or cancel the current attempt.");if(state.bindings.some(b=>b.currentAccountId===id||b.launchAccountId===id||b.currentAccountId===null&&b.pendingAccountId===id))throw new LoginRefusal("Switch agents away from this account before signing in again.");current.loginToken=token;current.login={sessionId:token,mode:account.provider==="claude"?"browser":mode};});
+    if(Date.now()>=deadlineMs)throw new LoginRefusal("Account sign-in took too long to prepare. Try again.");
+    await raceTimeout(
+     this.store.change(state=>{if(Date.now()>=deadlineMs)throw new LoginRefusal("Account sign-in took too long to prepare. Try again.");const current=accountFrom(state,id);if(current.loginToken)throw new LoginRefusal("Sign-in is already open. Continue or cancel the current attempt.");if(state.bindings.some(b=>b.currentAccountId===id||b.launchAccountId===id||b.currentAccountId===null&&b.pendingAccountId===id))throw new LoginRefusal("Switch agents away from this account before signing in again.");current.loginToken=token;current.login={sessionId:token,mode:account.provider==="claude"?"browser":mode};}),
+     deadlineMs-Date.now(),
+     ()=>new LoginRefusal("Account sign-in took too long to prepare. Try again."),
+    );
     this.usage.invalidate(id);
-    await this.checks.get(id)?.catch(()=>{});
+    const existingCheck=this.checks.get(id);
+    if(existingCheck)await raceTimeout(existingCheck.catch(()=>{}),Math.min(PROBE_TIMEOUT_MS,deadlineMs-Date.now()),()=>new LoginRefusal("An account check is still in progress. Try signing in again shortly."));
+    if(Date.now()>=deadlineMs)throw new LoginRefusal("Account sign-in took too long to prepare. Try again.");
    });
   }catch(error){
    // LoginSessions stops its already-established watchdog before rejecting.
-   // Clear only our reservation, never a newer attempt.
-   if(!this.logins.has(id,token))await this.store.change(r=>{const account=accountFrom(r,id);if(account.loginToken===token){account.loginToken=null;account.login=null;}});
+   // Clear only our reservation, never a newer attempt; bound waiting on a stalled store.queue by the remaining RPC deadline.
+   if(!this.logins.has(id,token)){
+    const clear=this.store.change(r=>{const account=r.accounts.find(a=>a.id===id);if(account?.loginToken===token){account.loginToken=null;account.login=null;}});
+    void clear.catch(()=>{});
+    const remaining=deadlineMs-Date.now();
+    if(remaining>0)await raceTimeout(clear,remaining,"Account sign-in took too long to prepare. Try again.").catch(()=>{});
+   }
    throw error;
   }finally{this.startingLogins.delete(id);}
  }
@@ -305,15 +582,32 @@ export class AccountController {
   this.usage.invalidate(id);
   return AccountSchema.parse(await this.checkAccount(id));
  }
- private async reconcileLogins(){
-  const state=await this.store.read();
-  for(const account of state.accounts.filter(a=>a.loginToken)){
-   if(account.login&&"sessionId" in account.login&&this.logins.has(account.id,account.login.sessionId))continue;
-   try{
-    const receipt=JSON.parse(await readFile(join(this.store.root,"logins",account.id+".json"),"utf8"));
-    if(receipt.loginToken===account.loginToken)await this.finishLogin(account.id);
-   }catch{/* Pending login remains reserved; the UI can still check explicitly. */}
+ private async reconcileLogins(maxWaitMs?:number){
+  let task=this.loginReconcileInFlight;
+  if(!task){
+   let run!:Promise<void>;
+   run=Promise.resolve().then(async()=>{
+    try{
+     const state=await this.store.read();
+     for(const account of state.accounts.filter(a=>a.loginToken)){
+      if(account.login&&"sessionId" in account.login&&this.logins.has(account.id,account.login.sessionId))continue;
+      try{
+       const receipt=JSON.parse(await readFile(join(this.store.root,"logins",account.id+".json"),"utf8"));
+       if(receipt.loginToken===account.loginToken)await this.finishLogin(account.id);
+      }catch{/* Pending login remains reserved; the UI can still check explicitly. */}
+     }
+    }finally{if(this.loginReconcileInFlight===run)this.loginReconcileInFlight=undefined;}
+   });
+   this.loginReconcileInFlight=run;
+   task=run;
   }
+  if(maxWaitMs===undefined){await task;return;}
+  void task.catch(()=>{});
+  if(maxWaitMs<=0)return;
+  let timer:ReturnType<typeof setTimeout>|undefined;
+  try{
+   await Promise.race([task,new Promise<void>(resolve=>{timer=setTimeout(resolve,maxWaitMs);timer.unref?.();})]);
+  }finally{if(timer)clearTimeout(timer);}
  }
  async finishLogin(id:string) {
   const before=accountFrom(await this.store.read(),id);
@@ -327,11 +621,18 @@ export class AccountController {
   void this.usage.refresh(id).catch(()=>{});
   return AccountSchema.parse(account);
  }
- async remove(id:string,paseo?:PaseoApi) {
+ async remove(id:string,paseo?:PaseoApi,deadlineMs=Date.now()+REMOVE_START_BUDGET_MS) {
   await this.ready;
-  if(paseo)await this.reconcileDeletedAgents(paseo);
+  const startDeadline=Math.min(deadlineMs,Date.now()+REMOVE_START_BUDGET_MS);
+  if(paseo){
+   await this.reconcileDeletedAgents(paseo,{force:true,accountId:id,maxWaitMs:startDeadline-Date.now()});
+   if(Date.now()>=startDeadline)throw new Error("Could not verify whether agents still use this account in time. Try again.");
+  }
   const account=accountFrom(await this.store.read(),id);
-  await this.store.remove(id,async(account,state)=>{
+  let deletionStarted=false;
+  let cancelTimer:(()=>void)|undefined;
+  const removeTask=this.store.remove(id,async(account,state)=>{
+   if(Date.now()>=startDeadline)throw new Error("Could not verify whether agents still use this account in time. Try again.");
    if(account.loginToken)throw new Error("Finish signing in in the terminal first.");
    if(!/^[A-Za-z0-9_-]+$/.test(id)||resolve(account.home)!==join(this.store.root,"accounts",id,account.provider))throw new Error("Invalid profile path.");
    const root=await realpath(this.store.root),paths:string[]=[];
@@ -340,18 +641,33 @@ export class AccountController {
     try{if(!(await lstat(parent)).isDirectory()||await realpath(parent)!==join(root,directory))throw new Error("The plugin directory has been redirected; cleanup was refused.");paths.push(join(parent,name));}
     catch(error){if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;}
    }
+   if(Date.now()>=startDeadline)throw new Error("Could not verify whether agents still use this account in time. Try again.");
+   // Once credential deletion begins, cancel the pre-deletion queue deadline so remove() never reports a verification timeout while deleting.
+   deletionStarted=true;
+   cancelTimer?.();
    await removeAccountCredentials(account,state);
    for(const path of paths)await rm(path,{recursive:true,force:true});
+  });
+  await new Promise<void>((resolvePromise,rejectPromise)=>{
+   let settled=false;
+   const finish=(fn:()=>void)=>{if(settled)return;settled=true;cancelTimer?.();fn();};
+   const remaining=startDeadline-Date.now();
+   if(remaining<=0){void removeTask.catch(()=>{});finish(()=>rejectPromise(new Error("Could not verify whether agents still use this account in time. Try again.")));return;}
+   const timer=setTimeout(()=>{if(deletionStarted)return;void removeTask.catch(()=>{});finish(()=>rejectPromise(new Error("Could not verify whether agents still use this account in time. Try again.")));},remaining);
+   timer.unref?.();
+   cancelTimer=()=>{clearTimeout(timer);};
+   removeTask.then(()=>finish(()=>resolvePromise()),error=>finish(()=>rejectPromise(error)));
   });
   await this.usage.invalidate(id);
   this.credentialVersions.delete(account.id);this.credentialProofs.delete(account.id);this.renewals.delete(account.id);
  }
- async integration(paseo:PaseoApi,enabled:boolean) {
+ async integration(paseo:PaseoApi,enabled:boolean,deadlineMs=Date.now()+RPC_BUDGET_MS) {
   await this.ready;
   if(this.applying.size||this.integrationChanging)throw new Error("Wait for the integration or account change to finish.");
   this.integrationChanging=true;
   try{
-   if(enabled)await installIntegration(paseo,this.store);else {await restoreIntegration(paseo,this.store);await this.store.change(r=>{for(const b of r.bindings){b.launchToken=null;if(b.currentAccountId!==`system-${b.provider}`){b.pendingAccountId=b.pendingAccountId??b.currentAccountId??b.launchAccountId;b.currentAccountId=null;b.status="error";b.error="Integration is disabled. The next reload will use the system CLI.";}}});}
+   if(enabled)await installIntegration(paseo,this.store,deadlineMs);
+   else await restoreIntegration(paseo,this.store,deadlineMs);
    return this.store.snapshot();
   }finally{this.integrationChanging=false;}
  }
@@ -396,5 +712,5 @@ export class AccountController {
   }});
   this.switches.set(paseo,service);return service;
  }
- async close(){this.disposed=true;await this.logins.close();await this.usage.close();}
+ async close(){this.disposed=true;this.drainAbortedWaiters();await this.logins.close();await this.usage.close();}
 }

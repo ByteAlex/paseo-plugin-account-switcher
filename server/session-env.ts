@@ -10,8 +10,8 @@ import type { Registry } from "./store";
  */
 export function profileEnv(registry: Registry, agentId: string, provider: string): Record<string, string> {
   if (provider !== "claude" && provider !== "codex") return {};
-  // Without the launcher in the chain the CLI runs on the system login, whatever the binding says.
-  if (!registry.integration.enabled || !registry.integration.providers.includes(provider)) return {};
+  // Without the launcher in the chain — or while a restore is pending — the CLI runs on the system login, whatever the binding says.
+  if (!registry.integration.enabled || registry.integration.restorePending || !registry.integration.providers.includes(provider)) return {};
   const binding = registry.bindings.find(candidate => candidate.agentId === agentId && candidate.provider === provider);
   // The same choice the launcher makes: the account an agent is launching on wins over the one it ran on.
   const accountId = binding?.launchAccountId ?? binding?.currentAccountId;
