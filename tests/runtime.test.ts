@@ -162,6 +162,24 @@ describe("standalone native-provider launcher", () => {
     expect(afterRestore.code).not.toBe(0); expect(afterRestore.stdout).toBe(""); expect(afterRestore.stderr).toContain("released");
   }, 20_000);
 
+  it("allows an existing binding that already had status error from a prior disable to launch once integration is re-enabled", async () => {
+    const { root, store } = await fixture(); const account = await store.add("codex", "Work");
+    await mkdir(account.home, { recursive: true });
+    await store.prepare("prior-error", "codex", account.id);
+    await store.change(registry => {
+      registry.integration.enabled = true;
+      registry.bindings[0].currentAccountId = null;
+      registry.bindings[0].launchAccountId = account.id;
+      registry.bindings[0].launchToken = null;
+      registry.bindings[0].status = "error";
+      registry.bindings[0].error = "Integration is disabled. The next reload will use the system CLI.";
+    });
+    await writeLaunchers(store);
+    const result = await run(launcherPath(root, "codex"), ["app-server"], { ...process.env, PASEO_AGENT_ID: "prior-error" });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ home: account.home, args: ["app-server"] });
+  });
+
   it("refuses a profile redirected to the shared home by a symlink", async () => {
     const { root, store } = await fixture(); const account = await store.add("codex", "Redirected");
     const source = (await store.read()).sourceHomes.codex;

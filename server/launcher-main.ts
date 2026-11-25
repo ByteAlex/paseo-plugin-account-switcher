@@ -54,7 +54,7 @@ async function main(): Promise<void> {
         current.integration.restorePending ||
         (registry.integration.enabled && !current.integration.enabled) ||
         !latest ||
-        latest.status === "error" ||
+        (binding?.status !== "error" && latest.status === "error") ||
         (latest.launchAccountId ?? latest.currentAccountId) !== account.id
       ) throw new LauncherError("The account reservation was released while this agent started; launch refused.");
     }
